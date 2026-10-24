@@ -34,6 +34,8 @@ export interface Health {
   ok: boolean;
   model: string;
   llm_configured: boolean;
+  storage: "local" | "vercel-blob" | "missing";
+  max_upload_mb: number;
 }
 
 /** Events emitted by POST /api/chat. Mirrors backend/app/agents.py. */
@@ -50,7 +52,8 @@ export type ChatEvent =
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail ?? `Request failed (${res.status})`);
+    if (res.status === 413) throw new Error("File is too large for the server's upload limit");
+    throw new Error(typeof body.detail === "string" ? body.detail : `Request failed (${res.status})`);
   }
   return res.json();
 }

@@ -2,6 +2,7 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 google-genai>=2.0
+vercel-blob>=0.5.0
 pypdf>=5.0
 pydantic>=2.7
 python-dotenv>=1.0

@@ -2,7 +2,8 @@
 
 BM25 needs no embedding model or vector database, and it is strong on financial
 text where exact terms ("EBITDA", "FY2024", "$4.2B") matter. The index is rebuilt
-lazily whenever the set of ready documents changes.
+whenever the set of ready documents changes; on a warm serverless instance it
+is reused across requests.
 """
 
 import math
@@ -11,7 +12,6 @@ import threading
 from collections import Counter
 
 from .schemas import Chunk
-from .store import store
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:[.,][0-9]+)*%?")
 _STOPWORDS = frozenset(
@@ -35,8 +35,7 @@ class BM25Index:
         self._idf: dict[str, float] = {}
         self._avgdl = 0.0
 
-    def _ensure_fresh(self) -> None:
-        by_doc = store.ready_chunks()
+    def refresh(self, by_doc: dict[str, list[Chunk]]) -> None:
         signature = tuple(sorted((d, len(c)) for d, c in by_doc.items()))
         with self._lock:
             if signature == self._signature:
@@ -54,7 +53,6 @@ class BM25Index:
             self._signature = signature
 
     def search(self, query: str, k: int, doc_ids: set[str] | None = None) -> list[tuple[Chunk, float]]:
-        self._ensure_fresh()
         terms = tokenize(query)
         if not terms:
             return []

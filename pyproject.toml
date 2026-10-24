@@ -1,0 +1,25 @@
+[project]
+name = "documind"
+version = "2.0.0"
+description = "Multi-agent RAG document analyst (FastAPI + React + Gemini)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.162",
+    "python-multipart>=0.0.9",
+    "google-genai>=2.0",
+    "vercel-blob>=0.5.0",
+    "pypdf>=5.0",
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+]
+
+[tool.vercel]
+entrypoint = "backend.app.main:app"
+
+[tool.vercel.scripts]
+# Build the React app; FastAPI serves frontend/dist via app.frontend() and Vercel promotes it to the CDN.
+build = "cd frontend && npm ci && npm run build"
+
+[tool.uv]
+# This repo is an app, not an installable package: install dependencies only.
+package = false

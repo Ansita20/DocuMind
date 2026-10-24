@@ -1,23 +1,24 @@
+import asyncio
 import logging
 import os
 import time
 import uuid
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .agents import run_pipeline
-from .config import ALLOWED_EXTENSIONS, LLM_MODEL, CORS_ORIGINS, MAX_UPLOAD_BYTES
-from .ingestion import ingest_document
+from .config import ALLOWED_EXTENSIONS, CORS_ORIGINS, LLM_MODEL, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB
+from .ingestion import process
 from .retrieval import index
 from .schemas import ChatRequest, DocumentRecord, SearchRequest
-from .store import store
+from .store import StorageNotConfigured, store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-app = FastAPI(title="DocuMind RAG API", version="1.0.0")
+app = FastAPI(title="DocuMind RAG API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -26,24 +27,30 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(StorageNotConfigured)
+async def storage_missing(_: Request, exc: StorageNotConfigured) -> JSONResponse:
+    return JSONResponse({"detail": str(exc)}, status_code=503)
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {
         "ok": True,
         "model": LLM_MODEL,
         "llm_configured": bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
-        "documents": len(store.all()),
+        "storage": store.backend,
+        "max_upload_mb": MAX_UPLOAD_MB,
     }
 
 
 @app.get("/api/documents")
-def list_documents() -> list[DocumentRecord]:
-    return store.all()
+async def list_documents() -> list[DocumentRecord]:
+    return await store.all()
 
 
-@app.post("/api/documents", status_code=202)
-async def upload_documents(files: list[UploadFile], background: BackgroundTasks) -> list[DocumentRecord]:
-    """Accept files immediately and hand them to the background ingestion pipeline."""
+@app.post("/api/documents", status_code=201)
+async def upload_documents(files: list[UploadFile]) -> list[DocumentRecord]:
+    """Parse, chunk and store each file within the request; the response carries the final status."""
     for f in files:
         if Path(f.filename or "").suffix.lower() not in ALLOWED_EXTENSIONS:
             raise HTTPException(415, f"{f.filename}: only {', '.join(sorted(ALLOWED_EXTENSIONS))} are supported")
@@ -51,56 +58,57 @@ async def upload_documents(files: list[UploadFile], background: BackgroundTasks)
     created = []
     for f in files:
         ext = Path(f.filename).suffix.lower()
-        doc_id = uuid.uuid4().hex[:12]
-        dest = store.doc_dir(doc_id)
-        dest.mkdir(parents=True, exist_ok=True)
-        size, too_big = 0, False
-        with open(dest / f"original{ext}", "wb") as out:
-            while chunk := await f.read(1024 * 1024):
-                size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    too_big = True
-                    break
-                out.write(chunk)
-        doc = DocumentRecord(id=doc_id, filename=Path(f.filename).name, size_bytes=size, created_at=time.time())
-        if too_big:
-            limit = MAX_UPLOAD_BYTES // 1024 // 1024
-            doc = doc.model_copy(update={"status": "failed", "error": f"File exceeds {limit} MB", "detail": "Failed"})
-            store.add(doc)
-            (dest / f"original{ext}").unlink(missing_ok=True)
-        else:
-            store.add(doc)
-            background.add_task(ingest_document, doc_id)
+        data = await f.read(MAX_UPLOAD_BYTES + 1)
+        doc = DocumentRecord(
+            id=uuid.uuid4().hex[:12], filename=Path(f.filename).name, size_bytes=len(data), created_at=time.time()
+        )
+        if len(data) > MAX_UPLOAD_BYTES:
+            doc.status, doc.error, doc.detail = "failed", f"File exceeds {MAX_UPLOAD_MB:g} MB", "Failed"
+            created.append(doc)  # not stored: nothing useful to keep
+            continue
+        try:
+            pages, chunks = await asyncio.to_thread(process, doc.id, doc.filename, data, ext)
+            doc = doc.model_copy(
+                update={"status": "ready", "progress": 1.0, "detail": "Ready", "pages": pages, "chunks": len(chunks)}
+            )
+        except Exception as e:  # unreadable or empty files are recorded as failed documents
+            logging.exception("Processing failed for %s", doc.filename)
+            doc = doc.model_copy(update={"status": "failed", "error": str(e), "detail": "Failed"})
+            chunks = []
+        await store.save(doc, ext, data if doc.status == "ready" else None, chunks)
         created.append(doc)
     return created
 
 
 @app.get("/api/documents/{doc_id}")
-def get_document(doc_id: str) -> DocumentRecord:
-    doc = store.get(doc_id)
+async def get_document(doc_id: str) -> DocumentRecord:
+    doc = await store.get(doc_id)
     if doc is None:
         raise HTTPException(404, "Document not found")
     return doc
 
 
 @app.get("/api/documents/{doc_id}/file")
-def get_document_file(doc_id: str) -> FileResponse:
-    doc, path = store.get(doc_id), store.original_path(doc_id)
-    if doc is None or path is None:
+async def get_document_file(doc_id: str) -> Response:
+    doc, original = await store.get(doc_id), await store.original(doc_id)
+    if doc is None or original is None:
         raise HTTPException(404, "Document not found")
-    media = "application/pdf" if path.suffix == ".pdf" else "text/plain; charset=utf-8"
-    return FileResponse(path, media_type=media, filename=doc.filename, content_disposition_type="inline")
+    data, ext = original
+    media = "application/pdf" if ext == "pdf" else "text/plain; charset=utf-8"
+    safe_name = doc.filename.replace('"', "")
+    return Response(data, media_type=media, headers={"Content-Disposition": f'inline; filename="{safe_name}"'})
 
 
 @app.delete("/api/documents/{doc_id}", status_code=204)
-def delete_document(doc_id: str) -> None:
-    if not store.delete(doc_id):
+async def delete_document(doc_id: str) -> None:
+    if not await store.delete(doc_id):
         raise HTTPException(404, "Document not found")
 
 
 @app.post("/api/search")
-def search(req: SearchRequest) -> list[dict]:
+async def search(req: SearchRequest) -> list[dict]:
     """Inspect raw retrieval results without calling the LLM."""
+    index.refresh(await store.ready_chunks())
     hits = index.search(req.query, k=req.k, doc_ids=set(req.doc_ids) if req.doc_ids is not None else None)
     return [{"score": round(s, 3), **c.model_dump()} for c, s in hits]
 
@@ -112,3 +120,10 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# Production: serve the built React app (on Vercel it is promoted to the CDN at build time).
+# In development Vite serves the frontend and proxies /api here, so the build may not exist.
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+if FRONTEND_DIST.is_dir():
+    app.frontend("/", directory=FRONTEND_DIST)

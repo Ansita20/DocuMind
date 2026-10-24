@@ -66,7 +66,7 @@ export default function App() {
 
   return (
     <div className={`layout ${panel.open ? "with-sources" : ""}`}>
-      <Sidebar docs={docs} scope={scope} onScopeChange={setScope} onChanged={refreshDocs} />
+      <Sidebar docs={docs} scope={scope} onScopeChange={setScope} onChanged={refreshDocs} maxUploadMb={health?.max_upload_mb ?? null} />
 
       <main className="chat">
         <header className="chat-head">
@@ -75,9 +75,10 @@ export default function App() {
             <div className="muted small">
               {health ? (
                 <>
-                  <span className={`status-dot ${health.llm_configured ? "ok" : "warn"}`} />
+                  <span className={`status-dot ${health.llm_configured && health.storage !== "missing" ? "ok" : "warn"}`} />
                   {health.model}
                   {!health.llm_configured && " · no API key detected"}
+                  {health.storage === "missing" && " · no Blob store connected"}
                 </>
               ) : (
                 <>

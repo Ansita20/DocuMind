@@ -1,93 +1,94 @@
-"""Document registry persisted to disk.
+"""Document registry on top of Storage.
 
-Layout: DATA_DIR/docs/<doc_id>/{meta.json, chunks.json, original.<ext>}
+Layout: docs/<doc_id>/{original.<ext>, chunks.json, meta.json}
 
-Ingestion runs in worker threads while request handlers read on the event loop,
-so every mutation goes through a lock.
+meta.json is written last, so a document appears in listings only once it is
+complete. Reads are cached per (path, version) so a warm instance only fetches
+objects that changed since its last request.
 """
 
+import asyncio
 import json
-import shutil
-import threading
-from pathlib import Path
+import mimetypes
 
 from .config import DATA_DIR
 from .schemas import Chunk, DocumentRecord
+from .storage import make_storage
 
-DOCS_DIR = DATA_DIR / "docs"
-DOCS_DIR.mkdir(parents=True, exist_ok=True)
+PREFIX = "docs/"
+
+
+class StorageNotConfigured(RuntimeError):
+    pass
 
 
 class DocumentStore:
     def __init__(self) -> None:
-        self._lock = threading.RLock()
-        self._docs: dict[str, DocumentRecord] = {}
-        self._chunks: dict[str, list[Chunk]] = {}
-        self._load()
+        self.storage = make_storage(DATA_DIR)
+        self._cache: dict[tuple[str, str], object] = {}
 
-    def _load(self) -> None:
-        for meta_path in DOCS_DIR.glob("*/meta.json"):
-            doc = DocumentRecord.model_validate_json(meta_path.read_text())
-            if doc.status not in ("ready", "failed"):
-                # The server stopped mid-ingestion; the pipeline is not resumable.
-                doc.status, doc.error, doc.detail = "failed", "Interrupted by server restart", "Re-upload to retry"
-            self._docs[doc.id] = doc
-            chunks_path = meta_path.parent / "chunks.json"
-            if doc.status == "ready" and chunks_path.exists():
-                raw = json.loads(chunks_path.read_text())
-                self._chunks[doc.id] = [Chunk.model_validate(c) for c in raw]
+    @property
+    def backend(self) -> str:
+        return self.storage.name if self.storage else "missing"
 
-    def doc_dir(self, doc_id: str) -> Path:
-        return DOCS_DIR / doc_id
+    def _require(self):
+        if self.storage is None:
+            raise StorageNotConfigured(
+                "No Vercel Blob store is connected. In the Vercel dashboard open Storage → Create → Blob, "
+                "connect it to this project, then redeploy."
+            )
+        return self.storage
 
-    def original_path(self, doc_id: str) -> Path | None:
-        matches = list(self.doc_dir(doc_id).glob("original.*"))
-        return matches[0] if matches else None
+    async def _read_json(self, path: str, version: str, parse):
+        key = (path, version)
+        if key not in self._cache:
+            raw = await self._require().get(path)
+            self._cache[key] = parse(json.loads(raw)) if raw is not None else None
+        return self._cache[key]
 
-    def add(self, doc: DocumentRecord) -> None:
-        with self._lock:
-            self._docs[doc.id] = doc
-            self._persist_meta(doc)
+    async def _snapshot(self) -> dict[str, str]:
+        return await self._require().list(PREFIX)
 
-    def update(self, doc_id: str, **fields) -> DocumentRecord:
-        with self._lock:
-            doc = self._docs[doc_id].model_copy(update=fields)
-            self._docs[doc_id] = doc
-            self._persist_meta(doc)
-            return doc
+    async def all(self, snap: dict[str, str] | None = None) -> list[DocumentRecord]:
+        snap = snap if snap is not None else await self._snapshot()
+        metas = [p for p in snap if p.endswith("/meta.json")]
+        docs = await asyncio.gather(*(self._read_json(p, snap[p], DocumentRecord.model_validate) for p in metas))
+        return sorted((d for d in docs if d), key=lambda d: d.created_at, reverse=True)
 
-    def set_chunks(self, doc_id: str, chunks: list[Chunk]) -> None:
-        with self._lock:
-            self._chunks[doc_id] = chunks
-            path = self.doc_dir(doc_id) / "chunks.json"
-            path.write_text(json.dumps([c.model_dump() for c in chunks]))
+    async def get(self, doc_id: str) -> DocumentRecord | None:
+        return next((d for d in await self.all() if d.id == doc_id), None)
 
-    def get(self, doc_id: str) -> DocumentRecord | None:
-        with self._lock:
-            return self._docs.get(doc_id)
+    async def ready_chunks(self) -> dict[str, list[Chunk]]:
+        snap = await self._snapshot()
+        ready = [d.id for d in await self.all(snap) if d.status == "ready"]
+        paths = [f"{PREFIX}{d}/chunks.json" for d in ready if f"{PREFIX}{d}/chunks.json" in snap]
+        lists = await asyncio.gather(
+            *(self._read_json(p, snap[p], lambda raw: [Chunk.model_validate(c) for c in raw]) for p in paths)
+        )
+        return {p.split("/")[1]: chunks or [] for p, chunks in zip(paths, lists)}
 
-    def all(self) -> list[DocumentRecord]:
-        with self._lock:
-            return sorted(self._docs.values(), key=lambda d: d.created_at, reverse=True)
+    async def save(self, doc: DocumentRecord, ext: str, original: bytes | None, chunks: list[Chunk]) -> None:
+        storage = self._require()
+        base = f"{PREFIX}{doc.id}/"
+        if original is not None:
+            await storage.put(f"{base}original{ext}", original, mimetypes.types_map.get(ext, "application/octet-stream"))
+        if chunks:
+            await storage.put(f"{base}chunks.json", json.dumps([c.model_dump() for c in chunks]).encode(), "application/json")
+        await storage.put(f"{base}meta.json", doc.model_dump_json().encode(), "application/json")
 
-    def ready_chunks(self) -> dict[str, list[Chunk]]:
-        with self._lock:
-            return {d: c for d, c in self._chunks.items() if self._docs[d].status == "ready"}
+    async def original(self, doc_id: str) -> tuple[bytes, str] | None:
+        snap = await self._snapshot()
+        path = next((p for p in snap if p.startswith(f"{PREFIX}{doc_id}/original.")), None)
+        if path is None:
+            return None
+        data = await self._require().get(path)
+        return (data, path.rsplit(".", 1)[-1]) if data is not None else None
 
-    def delete(self, doc_id: str) -> bool:
-        with self._lock:
-            if self._docs.pop(doc_id, None) is None:
-                return False
-            self._chunks.pop(doc_id, None)
-            shutil.rmtree(self.doc_dir(doc_id), ignore_errors=True)
-            return True
-
-    def _persist_meta(self, doc: DocumentRecord) -> None:
-        d = self.doc_dir(doc.id)
-        d.mkdir(parents=True, exist_ok=True)
-        tmp = d / "meta.json.tmp"
-        tmp.write_text(doc.model_dump_json())
-        tmp.replace(d / "meta.json")
+    async def delete(self, doc_id: str) -> bool:
+        if await self.get(doc_id) is None:
+            return False
+        await self._require().delete_prefix(f"{PREFIX}{doc_id}/")
+        return True
 
 
 store = DocumentStore()

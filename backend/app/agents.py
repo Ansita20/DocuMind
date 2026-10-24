@@ -18,9 +18,9 @@ from google.genai import errors, types
 from pydantic import BaseModel
 
 from .config import LLM_MODEL, RETRIEVAL_TOP_K
-from .retrieval import multi_query_search
+from .retrieval import index, multi_query_search
 from .schemas import ChatRequest, ChatTurn, Chunk
-from .store import store
+from .store import StorageNotConfigured, store
 
 log = logging.getLogger(__name__)
 
@@ -176,7 +176,7 @@ BLOCKED = {
 async def run_pipeline(req: ChatRequest) -> AsyncIterator[str]:
     try:
         turns = _normalize(req.messages)
-        ready = [d for d in store.all() if d.status == "ready"]
+        ready = [d for d in await store.all() if d.status == "ready"]
         if req.doc_ids is not None:
             ready = [d for d in ready if d.id in set(req.doc_ids)]
         scope = {d.id for d in ready}
@@ -191,6 +191,7 @@ async def run_pipeline(req: ChatRequest) -> AsyncIterator[str]:
         chunks: list[Chunk] = []
         if the_plan["needs_retrieval"] and scope:
             yield sse("stage", {"id": "retrieve", "status": "active", "detail": f"Searching {len(scope)} document(s)"})
+            index.refresh(await store.ready_chunks())
             chunks = multi_query_search(the_plan["sub_queries"], k=RETRIEVAL_TOP_K, doc_ids=scope)
             detail = f"{len(chunks)} passages from {len({c.doc_id for c in chunks})} document(s)"
         else:
@@ -237,7 +238,7 @@ async def run_pipeline(req: ChatRequest) -> AsyncIterator[str]:
             "output_tokens": (usage.candidates_token_count or 0) if usage else 0,
         })
 
-    except ValueError as e:  # bad history or missing API key
+    except (ValueError, StorageNotConfigured) as e:  # bad history, missing API key or storage
         yield sse("error", {"message": str(e)})
     except errors.ClientError as e:
         log.warning("Gemini client error: %s", e)
