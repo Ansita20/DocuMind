@@ -2,6 +2,8 @@
 
 Upload PDFs (annual reports, 10-Ks, earnings decks) and ask questions about them. Answers stream in token by token, with page-level citations you can click to see the exact passage the answer came from.
 
+**Live demo:** https://frontend-nine-rho-47.vercel.app/
+
 **Stack:** React 19 + Vite + TypeScript · FastAPI · Google Gemini (`gemini-3.8-flash`) via the official `google-genai` SDK.
 
 ## Architecture
